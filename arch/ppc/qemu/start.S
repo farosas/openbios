@@ -25,6 +25,10 @@
 #define ILLEGAL_VECTOR( v )	.org __vectors + v ; vector__##v: bl trap_error ;
 #define VECTOR( v, dummystr )	.org __vectors + v ; vector__##v
 
+#define SPR_TLBMISS 980
+#define SPR_PTEHI   981
+#define SPR_PTELO   982
+
 #ifdef CONFIG_PPC_64BITSUPPORT
 
 /* We're trying to use the same code for the ppc32 and ppc64 handlers here.
@@ -162,6 +166,76 @@
 
 .macro EXCEPTION_EPILOGUE
 	EXCEPTION_EPILOGUE_TEMPLATE
+.endm
+
+.macro ITLB_SEARCH
+	TLB_SEARCH
+.endm
+
+.macro DTLB_SEARCH
+	TLB_SEARCH 1
+.endm
+
+.macro TLB_SEARCH data
+	mfspr	r0,SPR_TLBMISS /* EA of access that missed */
+	rlwinm	r0,r0,20,16,31 /* mask out lower 16 bits of EA */
+	mfspr	r1,SPR_PTEHI   /* PTEHI[1:24] has the VSID */
+	rlwinm	r1,r1,25,8,31  /* mask out upper 23 bits of VSID */
+
+	xor	r1,r0,r1       /* primary hash */
+	mfsdr1	r3
+	rlwinm	r0,r3,10,13,31 /* align HTMEXT and HTABMASK fields */
+	ori	r0,r0,0x3ff    /* mask out HTMEXT and HTABMASK */
+	and	r1,r0,r1
+	rlwinm	r0,r3,26,13,21
+	or	r1,r0,r1
+
+/* 32-bit PTEG address generation into r2 */
+	andis.	r2,r3,0xfe00
+	rlwimi	r2,r1,6,7,25
+
+	xor	r1,r1,r1
+	addi	r1,r1,8
+	mfspr	r3,SPR_PTEHI
+	addi	r2,r2,-8
+
+1:
+	mtctr	r1
+2:
+	lwzu	r1,8(r2)      /* get next pte */
+	cmp	0,r1,r3
+	bdnzf	eq,2b
+	beq	1f           /* found */
+
+	andi.	r1,r3,0x0040   /* see if we have done second hash */
+.ifnb data
+	bne	do_dsi
+.else
+	bne	do_isi
+.endif
+	mfspr	r0,SPR_TLBMISS /* EA of access that missed */
+	rlwinm	r0,r0,20,16,3  /* mask out lower 16 bits of EA */
+	mfspr	r1,SPR_PTEHI   /* PTEHI[1:24] has the VSID */
+	rlwinm	r1,r1,25,8,31  /* mask out uppder 23 bits of VSID */
+
+	xor	r1,r0,r1       /* primary hash */
+	mfsdr1	r3
+	rlwinm	r0,r3,10,13,31  /* align HTMEXT and HTABMASK fields */
+	ori	r0,r0,0x3ff     /* mask out HTMEXT and HTABMASK */
+	and	r1,r0,r1
+	rlwinm	r0,r3,26,13,21
+	or	r1,r0,r1
+
+/* 32-bit PTEG address generation into r2 */
+	andis.	r2,r3,0xfe00
+	rlwimi	r2,r1,6,7,25
+
+	ori	r3,r3,0x0040
+	addi	r1,r0,8
+	addi	r2,r2,-8
+	b	1b
+
+1:
 .endm
 
 #undef ULONG_SIZE
@@ -329,9 +403,16 @@ ILLEGAL_VECTOR( 0xd00 )
 ILLEGAL_VECTOR( 0xe00 )
 ILLEGAL_VECTOR( 0xf00 )
 ILLEGAL_VECTOR( 0xf20 )
-ILLEGAL_VECTOR( 0x1000 )
-ILLEGAL_VECTOR( 0x1100 )
-ILLEGAL_VECTOR( 0x1200 )
+
+VECTOR( 0x1000, "IFTLB" ):
+	b	insn_tlb_miss
+
+VECTOR( 0x1100, "DLTLB" ):
+	b	data_load_tlb_miss
+
+VECTOR( 0x1200, "DSTLB" ):
+	b	data_store_tlb_miss
+
 ILLEGAL_VECTOR( 0x1300 )
 ILLEGAL_VECTOR( 0x1400 )
 ILLEGAL_VECTOR( 0x1500 )
@@ -372,6 +453,155 @@ real_isi:
 
 exception_return:
 	EXCEPTION_EPILOGUE
+
+/*
+ * Instruction TLB miss
+ * Entry:
+ *       srr0    -> address of instruction that missed
+ *       srr1    -> 16:31 = saved MSR
+ *       TLBMISS -> ea that missed
+ *       PTEHI   -> upper 32-bits of pte value
+ *       PTELO   -> lower 32-bits of pte value
+ */
+insn_tlb_miss:
+	EXCEPTION_PREAMBLE
+	mtsprg3	r1             /* save ABI frame, we might call into C later */
+
+	ITLB_SEARCH
+
+/* pte found*/
+	lwz	r1,4(r2)          /* load tlb entry lower-word */
+	andi.	r3,r1,8           /* check G-bit */
+	bne	isi_prot          /* if guarded, take an ISI */
+
+	ori	r1,r1,0x100       /* set reference bit */
+	mtspr	SPR_PTELO,r1      /* put rpn into PTELO */
+	mfspr	r0,SPR_TLBMISS
+	tlbli	r0                /* load the itlb */
+	srwi	r1,r1,8           /* get byte 7 of pte */
+	stb	r1,6(r2)          /* update page table */
+
+	mfsprg3 r1           /* restore C ABI stack */
+	b exception_return
+
+/* Guarded memory protection violation: synthesize an ISI exception */
+isi_prot:
+	mfsrr1	r3
+	andi.	r2,r3,0xffff /* clean upper SRR1 */
+	addis	r2,r2,0x0800 /* protection violation flag */
+	b	1f
+
+do_isi:
+	mfsrr1	r3
+	andi.	r2,r3,0xffff
+	addis	r2,r2,0x4000 /* pte not found flag */
+	mtsrr1	r2
+	mtcrf	0x80,r3
+1:
+	mfsprg3 r1           /* restore C ABI stack */
+	LOAD_REG_FUNC(r3, isi_exception)
+	mtctr	r3
+	bctrl
+	b exception_return
+
+/*
+ * Data Load TLB miss
+ * Entry:
+ *       srr0    -> address of instruction that caused data tlb miss
+ *       srr1    -> 16:31 = saved MSR
+ *       TLBMISS -> ea that missed
+ *       PTEHI   -> upper 32-bits of pte value
+ *       PTELO   -> lower 32-bits of pte value
+ */
+data_load_tlb_miss:
+	EXCEPTION_PREAMBLE
+	mtsprg3	r1             /* save ABI frame, we might call into C later */
+
+	DTLB_SEARCH
+
+/* pte found */
+	lwz	r1,4(r2)       /* load tlb entry lower-word */
+	ori	r1,r1,0x100    /* set reference bit */
+	mtspr	SPR_PTELO,r1   /* put RPN into PTELO */
+	mfspr	r0,SPR_TLBMISS
+	tlbld	r0             /* load the dtlb */
+	srwi	r1,r1,8        /* get byte 7 of pte */
+	stb	r1,6(r2)       /* update page table */
+
+	mfsprg3 r1             /* restore C ABI stack */
+	b exception_return
+
+/*
+ * Data Store TLB miss
+ * Entry:
+ *       srr0    -> address of instruction that caused data tlb miss
+ *       srr1    -> 16:31 = saved MSR
+ *       TLBMISS -> ea that missed
+ *       PTEHI   -> upper 32-bits of pte value
+ *       PTELO   -> lower 32-bits of pte value
+ */
+data_store_tlb_miss:
+	EXCEPTION_PREAMBLE
+	mtsprg3	r1             /* save ABI frame, we might call into C later */
+
+	DTLB_SEARCH
+
+/* pte found */
+	lwz	r1,4(r2)               /* load tlb entry lower-word */
+	andi.	r3,r1,0x80             /* check the C-bit */
+	beq	data_store_prot_check  /* if (C==0) go check protection modes */
+3:
+	ori	r1,r1,0x180     /* set reference and change bit */
+	mtspr	SPR_PTELO,r1    /* put RPN into PTELO */
+	mfspr	r0,SPR_TLBMISS
+	xori	r0,r0,0x01      /* toggle LRU bit */
+	tlbld	r0              /* load the dtlb */
+	sth	r1,6(r2)        /* update page table */
+
+	mfsprg3 r1             /* restore C ABI stack */
+	b exception_return
+
+data_store_prot_check:
+	rlwinm.	r3,r1,30,0,1  /* test PP */
+	bge-	1f            /* if (PP==00 or PP==01) go check KEY bit */
+	andi.	r3,r1,1       /* test PP[0] */
+	beq+	3b            /* return if PP[0]==0 */
+	b	dsi_prot
+1:
+	mfsrr1	r3
+	andis.	r3,r3,0x0008  /* test the KEY bit (SRR1-bit 12) */
+	ble	3b
+
+dsi_prot:
+	mfsrr1	r3
+	rlwinm	r1,r3,9,6,6  /* copy load/store bit over */
+	addis	r1,r1,0x0800 /* protection violation flag */
+	b	2f
+
+do_dsi:
+	mfsrr1	r3
+	rlwinm	r1,r3,9,6,6   /* copy load/store bit over */
+	addis	r1,r1,0x4000  /* pte not found */
+
+2:
+	andis.	r2,r3,0x0200  /* save the Altivec Avail. bit in r2 */
+	andi.	r3,r3,0xffff  /* clear upper SRR1 */
+	or	r2,r2,r3
+	mtsrr1	r2
+	mtdsisr	r1
+	mfspr	r1,SPR_TLBMISS
+	rlwinm	r1,r1,0,0,30   /* Clear the LRU bit */
+	rlwinm.	r2,r2,0,31,31  /* test LE bit */
+	beq	3f
+	xori	r1,r1,0x07
+3:
+	mtdar	r1
+	mtcrf	0x80,r3
+	mfsprg3 r1           /* restore C ABI stack */
+	LOAD_REG_FUNC(r3, dsi_exception)
+	mtctr	r3
+	bctrl
+	b exception_return
 
 GLOBL(__vectors_end):
 
